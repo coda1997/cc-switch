@@ -3,6 +3,6 @@ packages: []
 onlyBuiltDependencies:
   - '@tailwindcss/oxide'
   - esbuild
-
-ignoredBuiltDependencies:
   - msw
+
+verifyDepsBeforeRun: false

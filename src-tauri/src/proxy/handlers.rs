@@ -19,7 +19,7 @@ use super::{
     providers::{
         codex_chat_common::extract_reasoning_field_text,
         codex_chat_history::record_responses_sse_stream, get_adapter, get_claude_api_format,
-        streaming::create_anthropic_sse_stream,
+        streaming::create_anthropic_sse_stream_with_options,
         streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
         streaming_responses::create_anthropic_sse_stream_from_responses, transform,
@@ -316,6 +316,9 @@ async fn handle_claude_transform(
     if use_streaming {
         // 根据 api_format 选择流式转换器
         let stream = response.bytes_stream();
+        // antml 兜底仅对 GitHub Copilot 供应商 + 开关开启时启用。
+        let antml_fallback_enabled =
+            ctx.provider.is_github_copilot() && ctx.copilot_optimizer_config.antml_fallback;
         let sse_stream: Box<
             dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin,
         > = if api_format == "openai_responses" {
@@ -329,7 +332,10 @@ async fn handle_claude_transform(
                 tool_schema_hints.clone(),
             )))
         } else {
-            Box::new(Box::pin(create_anthropic_sse_stream(stream)))
+            Box::new(Box::pin(create_anthropic_sse_stream_with_options(
+                stream,
+                antml_fallback_enabled,
+            )))
         };
 
         // 创建使用量收集器；关闭 usage logging 时不要再解析转换后的 SSE。
@@ -469,7 +475,7 @@ async fn handle_claude_transform(
     };
 
     // 根据 api_format 选择非流式转换器
-    let anthropic_response = if api_format == "openai_responses" {
+    let mut anthropic_response = if api_format == "openai_responses" {
         transform_responses::responses_to_anthropic(upstream_response)
     } else if api_format == "gemini_native" {
         transform_gemini::gemini_to_anthropic_with_shadow_and_hints(
@@ -486,6 +492,14 @@ async fn handle_claude_transform(
         log::error!("[Claude] 转换响应失败: {e}");
         e
     })?;
+
+    // antml 兜底（仅 GitHub Copilot）：上游偶发把 Claude 的 antml 工具调用当文本返回，
+    // 反解析回结构化 tool_use，避免 Claude Code 收到「文本 + end_turn」后停住。
+    if ctx.provider.is_github_copilot() && ctx.copilot_optimizer_config.antml_fallback {
+        if super::providers::antml_fallback::rewrite_anthropic_message(&mut anthropic_response) {
+            log::info!("[Copilot] antml 兜底：非流式响应中检测到泄漏的工具调用，已还原为 tool_use");
+        }
+    }
 
     // 记录使用量
     // 全 0 usage 不落账（对齐 Codex 流式收集器的 skip）：SSE 聚合兜底救回的流

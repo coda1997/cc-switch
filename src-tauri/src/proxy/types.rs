@@ -322,6 +322,13 @@ pub struct CopilotOptimizerConfig {
     /// 重试，那时第一次请求已经消耗了一次 premium quota。主动剥离避免这次浪费。
     #[serde(default = "default_true")]
     pub strip_thinking: bool,
+    /// antml 工具调用兜底解析（默认开启 — kill switch）
+    ///
+    /// Copilot 偶发把 Claude 生成的 antml 工具调用 XML 当普通文本返回，导致 Claude Code
+    /// 收到「文本 + end_turn」后停住。开启时，代理在响应侧检测泄漏的 antml 包裹标签并
+    /// 反解析回结构化 tool_use。仅对 GitHub Copilot 供应商生效；若误判可关闭。
+    #[serde(default = "default_true")]
+    pub antml_fallback: bool,
 }
 
 fn default_warmup_model() -> String {
@@ -340,6 +347,7 @@ impl Default for CopilotOptimizerConfig {
             warmup_downgrade: true,
             warmup_model: "gpt-5-mini".to_string(),
             strip_thinking: true,
+            antml_fallback: true,
         }
     }
 }
