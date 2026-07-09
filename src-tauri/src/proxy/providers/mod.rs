@@ -12,6 +12,7 @@
 //! - `transform`: 格式转换
 
 mod adapter;
+pub mod antml_fallback;
 mod auth;
 mod claude;
 mod codex;
