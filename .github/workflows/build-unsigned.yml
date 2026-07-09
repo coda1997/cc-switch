@@ -1,0 +1,130 @@
+name: Build (unsigned artifacts)
+
+# 手动触发的精简打包流水线：只编译 + 打包 macOS / Windows(x64+arm64)，
+# 不做代码签名、不做 notarization、不发 GitHub Release。产物作为 Actions
+# artifact 上传，可在 workflow run 页面直接下载。
+#
+# 与 release.yml 的区别：release.yml 由 v* tag 触发、依赖签名 secrets、会发布
+# 公开 Release；本 workflow 不依赖任何 secret，适合在 fork 上验证构建产物。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            label: macos
+          - os: windows-2022
+            label: windows-x64
+          - os: windows-11-arm
+            arch: arm64
+            label: windows-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Windows ARM64 target
+        if: runner.os == 'Windows' && matrix.arch == 'arm64'
+        shell: pwsh
+        run: rustup target add aarch64-pc-windows-msvc
+
+      - name: Add macOS targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Setup pnpm
+        if: matrix.arch != 'arm64'
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.12.3
+
+      - name: Setup pnpm (Windows ARM64)
+        if: runner.os == 'Windows' && matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          corepack enable
+          corepack prepare pnpm@10.12.3 --activate
+          node --version
+          pnpm --version
+
+      - name: Setup LLVM for Windows ARM64
+        if: runner.os == 'Windows' && matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $llvmRoot = 'C:\Program Files\LLVM'
+          if (-not (Test-Path $llvmRoot)) {
+            throw "LLVM not found at $llvmRoot"
+          }
+          $llvmBin = Join-Path $llvmRoot 'bin'
+          "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CLANG_PATH=$(Join-Path $llvmBin 'clang.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Tauri App (macOS)
+        if: runner.os == 'macOS'
+        run: pnpm tauri build --target universal-apple-darwin
+
+      - name: Build Tauri App (Windows x64)
+        if: runner.os == 'Windows' && matrix.arch != 'arm64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pnpm tauri build
+
+      - name: Build Tauri App (Windows ARM64)
+        if: runner.os == 'Windows' && matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pnpm tauri build --target aarch64-pc-windows-msvc --bundles msi
+
+      - name: Collect artifacts (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out
+          find src-tauri/target -type f \( -name "*.dmg" -o -name "*.app.tar.gz" \) -exec cp {} out/ \; || true
+          # .app 目录打成 tar 方便上传
+          APP=$(find src-tauri/target -maxdepth 5 -type d -name "*.app" | head -1 || true)
+          if [ -n "$APP" ]; then tar -czf "out/CC-Switch-macos-app.tar.gz" -C "$(dirname "$APP")" "$(basename "$APP")"; fi
+          ls -la out
+
+      - name: Collect artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Get-ChildItem -Path src-tauri/target -Recurse -Include *.msi,*.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'bundle' } |
+            ForEach-Object { Copy-Item $_.FullName out/ }
+          Get-ChildItem out
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cc-switch-${{ matrix.label }}
+          path: out/*
+          if-no-files-found: error
