@@ -17,7 +17,7 @@ use super::{
     },
     handler_context::RequestContext,
     providers::{
-        codex_chat_common::extract_reasoning_field_text,
+        antml_fallback, codex_chat_common::extract_reasoning_field_text,
         codex_chat_history::record_responses_sse_stream, get_adapter, get_claude_api_format,
         streaming::create_anthropic_sse_stream_with_options,
         streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
@@ -312,13 +312,16 @@ async fn handle_claude_transform(
     };
     let tool_schema_hints = transform_gemini::extract_anthropic_tool_schema_hints(original_body);
     let tool_schema_hints = (!tool_schema_hints.is_empty()).then_some(tool_schema_hints);
+    let antml_tool_schemas = antml_fallback::extract_tool_schemas(original_body);
 
     if use_streaming {
         // 根据 api_format 选择流式转换器
         let stream = response.bytes_stream();
         // antml 兜底仅对 GitHub Copilot 供应商 + 开关开启时启用。
-        let antml_fallback_enabled =
-            ctx.provider.is_github_copilot() && ctx.copilot_optimizer_config.antml_fallback;
+        let antml_fallback_enabled = ctx.provider.is_github_copilot()
+            && ctx.copilot_optimizer_config.enabled
+            && ctx.copilot_optimizer_config.antml_fallback
+            && !antml_tool_schemas.is_empty();
         let sse_stream: Box<
             dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin,
         > = if api_format == "openai_responses" {
@@ -335,6 +338,7 @@ async fn handle_claude_transform(
             Box::new(Box::pin(create_anthropic_sse_stream_with_options(
                 stream,
                 antml_fallback_enabled,
+                antml_tool_schemas.clone(),
             )))
         };
 
@@ -495,10 +499,12 @@ async fn handle_claude_transform(
 
     // antml 兜底（仅 GitHub Copilot）：上游偶发把 Claude 的 antml 工具调用当文本返回，
     // 反解析回结构化 tool_use，避免 Claude Code 收到「文本 + end_turn」后停住。
-    if ctx.provider.is_github_copilot() && ctx.copilot_optimizer_config.antml_fallback {
-        if super::providers::antml_fallback::rewrite_anthropic_message(&mut anthropic_response) {
-            log::info!("[Copilot] antml 兜底：非流式响应中检测到泄漏的工具调用，已还原为 tool_use");
-        }
+    if ctx.provider.is_github_copilot()
+        && ctx.copilot_optimizer_config.enabled
+        && ctx.copilot_optimizer_config.antml_fallback
+        && antml_fallback::rewrite_anthropic_message(&mut anthropic_response, &antml_tool_schemas)
+    {
+        log::info!("[Copilot] antml 兜底：非流式响应中检测到泄漏的工具调用，已还原为 tool_use");
     }
 
     // 记录使用量

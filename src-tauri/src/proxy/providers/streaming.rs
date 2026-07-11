@@ -2,8 +2,8 @@
 //!
 //! 实现 OpenAI SSE → Anthropic SSE 格式转换
 
-use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use super::antml_fallback::{self, AntmlStreamGuard};
+use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -145,10 +145,15 @@ fn build_message_delta_event(stop_reason: Option<String>, usage_json: Option<Val
 }
 
 /// 创建 Anthropic SSE 流
+#[cfg(test)]
 pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
-    create_anthropic_sse_stream_with_options(stream, false)
+    create_anthropic_sse_stream_with_options(
+        stream,
+        false,
+        antml_fallback::AntmlToolSchemas::default(),
+    )
 }
 
 /// 与 [`create_anthropic_sse_stream`] 相同，但可开启 antml 工具调用兜底。
@@ -159,6 +164,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
 pub fn create_anthropic_sse_stream_with_options<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
     antml_fallback_enabled: bool,
+    antml_tool_schemas: antml_fallback::AntmlToolSchemas,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
@@ -169,8 +175,6 @@ pub fn create_anthropic_sse_stream_with_options<E: std::error::Error + Send + 's
         let mut has_sent_message_start = false;
         // antml 兜底状态机（未启用时 feed_text 原样放行，零行为变化）。
         let mut antml_guard = AntmlStreamGuard::new(antml_fallback_enabled);
-        // antml 兜底已接管收尾时，改写缓存 message_delta 的 stop_reason 为 tool_use。
-        let mut antml_forced_tool_use = false;
         // 某些上游 provider（如 OpenRouter 的 kimi-k2.6）会在 tool_use 后发送多个
         // 带 finish_reason 的 SSE chunk。Anthropic 协议要求每个消息流只能有一个
         // message_delta，重复会导致 Claude Code abort 连接。因此需要：
@@ -185,10 +189,11 @@ pub fn create_anthropic_sse_stream_with_options<E: std::error::Error + Send + 's
         let mut current_non_tool_block_index: Option<u32> = None;
         let mut tool_blocks_by_index: HashMap<usize, ToolBlockState> = HashMap::new();
         let mut open_tool_block_indices: HashSet<u32> = HashSet::new();
+        let mut saw_native_tool_calls = false;
 
         tokio::pin!(stream);
 
-        while let Some(chunk) = stream.next().await {
+        'upstream: while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
                     crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
@@ -203,49 +208,54 @@ pub fn create_anthropic_sse_stream_with_options<E: std::error::Error + Send + 's
                                 if data.trim() == "[DONE]" {
                                     log::debug!("[Claude/OpenRouter] <<< OpenAI SSE: [DONE]");
 
-                                    // antml 兜底：finish_reason 未到就 [DONE] 时，guard 仍缓冲着
-                                    // 未解析的 antml。先还原成 tool_use，再收尾，避免事件序错乱。
-                                    if antml_guard.is_armed() {
-                                        let buffered = antml_guard.take_buffer();
-                                        if !buffered.is_empty() {
+                                    // 没有 finish_reason 的候选 XML 不得恢复为工具调用。把候选或
+                                    // 哨兵前缀作为普通文本补发，并保证所有 content 事件先于终止事件。
+                                    let leftover = if antml_guard.is_armed() {
+                                        antml_guard.take_buffer()
+                                    } else {
+                                        antml_guard.take_unflushed_text()
+                                    };
+                                    if !leftover.is_empty() {
+                                        if current_non_tool_block_type == Some("text") {
+                                            if let Some(index) = current_non_tool_block_index {
+                                                let event = json!({
+                                                    "type": "content_block_delta",
+                                                    "index": index,
+                                                    "delta": {"type": "text_delta", "text": leftover}
+                                                });
+                                                yield Ok(Bytes::from(format!(
+                                                    "event: content_block_delta\ndata: {}\n\n",
+                                                    serde_json::to_string(&event).unwrap_or_default()
+                                                )));
+                                            }
+                                        } else {
                                             if let Some(index) = current_non_tool_block_index.take() {
                                                 let event = json!({"type": "content_block_stop", "index": index});
-                                                yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n",
-                                                    serde_json::to_string(&event).unwrap_or_default())));
+                                                yield Ok(Bytes::from(format!(
+                                                    "event: content_block_stop\ndata: {}\n\n",
+                                                    serde_json::to_string(&event).unwrap_or_default()
+                                                )));
                                             }
-                                            current_non_tool_block_type = None;
-                                            match antml_fallback::parse_function_calls(&buffered) {
-                                                Some(parsed) => {
-                                                    if !parsed.prose.is_empty() {
-                                                        let (events, next) = antml_fallback::standalone_text_sse_events(
-                                                            &parsed.prose, next_content_index);
-                                                        next_content_index = next;
-                                                        for ev in events { yield Ok(Bytes::from(ev)); }
-                                                    }
-                                                    let (events, next) = antml_fallback::tool_use_sse_events(
-                                                        &parsed.calls, next_content_index);
-                                                    next_content_index = next;
-                                                    for ev in events { yield Ok(Bytes::from(ev)); }
-                                                    antml_forced_tool_use = true;
-                                                    log::info!("[Copilot] antml 兜底：[DONE] 收尾还原 {} 个工具调用", parsed.calls.len());
-                                                    if pending_message_delta.is_none() && !has_emitted_message_delta {
-                                                        pending_message_delta = Some((Some("tool_use".to_string()), latest_usage.clone()));
-                                                    }
-                                                }
-                                                None => {
-                                                    let (events, next) = antml_fallback::standalone_text_sse_events(
-                                                        &buffered, next_content_index);
-                                                    next_content_index = next;
-                                                    for ev in events { yield Ok(Bytes::from(ev)); }
-                                                }
+                                            let (events, next) =
+                                                antml_fallback::standalone_text_sse_events(
+                                                    &leftover,
+                                                    next_content_index,
+                                                );
+                                            next_content_index = next;
+                                            for event in events {
+                                                yield Ok(Bytes::from(event));
                                             }
                                         }
                                     }
-                                    if antml_forced_tool_use {
-                                        if let Some((ref mut sr, _)) = pending_message_delta {
-                                            *sr = Some("tool_use".to_string());
-                                        }
+
+                                    if let Some(index) = current_non_tool_block_index.take() {
+                                        let event = json!({"type": "content_block_stop", "index": index});
+                                        yield Ok(Bytes::from(format!(
+                                            "event: content_block_stop\ndata: {}\n\n",
+                                            serde_json::to_string(&event).unwrap_or_default()
+                                        )));
                                     }
+                                    current_non_tool_block_type = None;
 
                                     // 流正常结束，发出缓存的 message_delta（含完整 usage）。
                                     if let Some((stop_reason, usage_json)) = pending_message_delta.take() {
@@ -256,13 +266,15 @@ pub fn create_anthropic_sse_stream_with_options<E: std::error::Error + Send + 's
                                         yield Ok(Bytes::from(sse_data));
                                     }
 
-                                    let event = json!({"type": "message_stop"});
-                                    let sse_data = format!("event: message_stop\ndata: {}\n\n",
-                                        serde_json::to_string(&event).unwrap_or_default());
-                                    log::debug!("[Claude/OpenRouter] >>> Anthropic SSE: message_stop");
-                                    yield Ok(Bytes::from(sse_data));
+                                    if !has_sent_message_stop {
+                                        let event = json!({"type": "message_stop"});
+                                        let sse_data = format!("event: message_stop\ndata: {}\n\n",
+                                            serde_json::to_string(&event).unwrap_or_default());
+                                        log::debug!("[Claude/OpenRouter] >>> Anthropic SSE: message_stop");
+                                        yield Ok(Bytes::from(sse_data));
+                                    }
                                     has_sent_message_stop = true;
-                                    continue;
+                                    break 'upstream;
                                 }
 
                                 if let Ok(chunk) = serde_json::from_str::<OpenAIStreamChunk>(data) {
@@ -424,6 +436,7 @@ pub fn create_anthropic_sse_stream_with_options<E: std::error::Error + Send + 's
                                         // 处理工具调用
                                         if let Some(tool_calls) = &choice.delta.tool_calls {
                                             if !tool_calls.is_empty() {
+                                                saw_native_tool_calls = true;
                                                 if let Some(index) = current_non_tool_block_index.take() {
                                                     let event = json!({
                                                         "type": "content_block_stop",
@@ -684,9 +697,18 @@ pub fn create_anthropic_sse_stream_with_options<E: std::error::Error + Send + 's
                                             // antml 兜底：guard 已捕获泄漏的工具调用文本。
                                             // 此处（text/tool 块已收尾后）把缓冲反解析成 tool_use 事件，
                                             // 并把 stop_reason 改写为 tool_use，让 Claude Code 继续执行。
-                                            let final_stop_reason = if antml_guard.is_armed() {
+                                            let mut final_stop_reason = stop_reason;
+                                            if antml_guard.is_armed() {
                                                 let buffered = antml_guard.take_buffer();
-                                                match antml_fallback::parse_function_calls(&buffered) {
+                                                if saw_native_tool_calls {
+                                                    log::info!(
+                                                        "[Copilot] antml 兜底：检测到原生 tool_calls，跳过重复 XML 恢复"
+                                                    );
+                                                } else if finish_reason == "stop" {
+                                                    match antml_fallback::parse_function_calls(
+                                                        &buffered,
+                                                        &antml_tool_schemas,
+                                                    ) {
                                                     Some(parsed) => {
                                                         if !parsed.prose.is_empty() {
                                                             let (events, next) =
@@ -708,15 +730,18 @@ pub fn create_anthropic_sse_stream_with_options<E: std::error::Error + Send + 's
                                                         for ev in events {
                                                             yield Ok(Bytes::from(ev));
                                                         }
-                                                        antml_forced_tool_use = true;
                                                         log::info!(
                                                             "[Copilot] antml 兜底：流式响应还原 {} 个工具调用",
                                                             parsed.calls.len()
                                                         );
-                                                        Some("tool_use".to_string())
+                                                        final_stop_reason =
+                                                            Some("tool_use".to_string());
                                                     }
                                                     // 解析失败：把缓冲原样作为文本补发，避免吞内容。
                                                     None => {
+                                                        log::warn!(
+                                                            "[Copilot] antml 兜底：候选 XML 未通过完整性或工具 schema 校验，按文本返回"
+                                                        );
                                                         if !buffered.is_empty() {
                                                             let (events, next) =
                                                                 antml_fallback::standalone_text_sse_events(
@@ -728,12 +753,20 @@ pub fn create_anthropic_sse_stream_with_options<E: std::error::Error + Send + 's
                                                                 yield Ok(Bytes::from(ev));
                                                             }
                                                         }
-                                                        stop_reason
                                                     }
                                                 }
-                                            } else {
-                                                stop_reason
-                                            };
+                                                } else if !buffered.is_empty() {
+                                                    let (events, next) =
+                                                        antml_fallback::standalone_text_sse_events(
+                                                            &buffered,
+                                                            next_content_index,
+                                                        );
+                                                    next_content_index = next;
+                                                    for ev in events {
+                                                        yield Ok(Bytes::from(ev));
+                                                    }
+                                                }
+                                            }
 
                                             // 缓存 message_delta，等到 [DONE] 时发送（以便收集完整的 usage）
                                             pending_message_delta = Some((final_stop_reason, usage_json));
@@ -765,76 +798,33 @@ pub fn create_anthropic_sse_stream_with_options<E: std::error::Error + Send + 's
         // 流自然结束但未收到 [DONE] 时，确保发送缓存的 message_delta 和 message_stop。
         // 若上游已显式报错，则只保留 error 事件，避免把失败伪装成成功完成。
         if !stream_ended_with_error {
-            // antml 兜底收尾：finish_reason/[DONE] 未到达就断流时，guard 里仍缓冲着
-            // 未解析的 antml。这里补做与 finish_reason 分支相同的还原，避免吞掉工具调用。
-            if antml_guard.is_armed() {
-                let buffered = antml_guard.take_buffer();
-                if !buffered.is_empty() {
+            // EOF 没有 finish_reason 时必须失败关闭：候选 XML 只作为文本补发，
+            // 不合成 tool_use 或成功终止事件。
+            let leftover = if antml_guard.is_armed() {
+                antml_guard.take_buffer()
+            } else {
+                antml_guard.take_unflushed_text()
+            };
+            if !leftover.is_empty() {
+                if current_non_tool_block_type == Some("text") {
+                    if let Some(index) = current_non_tool_block_index {
+                        let event = json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {"type": "text_delta", "text": leftover}
+                        });
+                        yield Ok(Bytes::from(format!("event: content_block_delta\ndata: {}\n\n",
+                            serde_json::to_string(&event).unwrap_or_default())));
+                    }
+                } else {
                     if let Some(index) = current_non_tool_block_index.take() {
                         let event = json!({"type": "content_block_stop", "index": index});
                         yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n",
                             serde_json::to_string(&event).unwrap_or_default())));
                     }
-                    current_non_tool_block_type = None;
-
-                    match antml_fallback::parse_function_calls(&buffered) {
-                        Some(parsed) => {
-                            if !parsed.prose.is_empty() {
-                                let (events, next) = antml_fallback::standalone_text_sse_events(
-                                    &parsed.prose, next_content_index);
-                                next_content_index = next;
-                                for ev in events { yield Ok(Bytes::from(ev)); }
-                            }
-                            let (events, next) = antml_fallback::tool_use_sse_events(
-                                &parsed.calls, next_content_index);
-                            next_content_index = next;
-                            for ev in events { yield Ok(Bytes::from(ev)); }
-                            antml_forced_tool_use = true;
-                            log::info!(
-                                "[Copilot] antml 兜底：断流收尾还原 {} 个工具调用",
-                                parsed.calls.len()
-                            );
-                            // 断流时通常没有缓存的 message_delta，补一个（usage 尽力而为）。
-                            if pending_message_delta.is_none() && !has_emitted_message_delta {
-                                pending_message_delta =
-                                    Some((Some("tool_use".to_string()), latest_usage.clone()));
-                            }
-                        }
-                        None => {
-                            let (events, next) = antml_fallback::standalone_text_sse_events(
-                                &buffered, next_content_index);
-                            next_content_index = next;
-                            for ev in events { yield Ok(Bytes::from(ev)); }
-                        }
-                    }
-                }
-            } else {
-                // 未上膛但持有过哨兵前缀：补发为文本，避免结尾字符被吞。
-                let leftover = antml_guard.take_unflushed_text();
-                if !leftover.is_empty() {
-                    if current_non_tool_block_type == Some("text") {
-                        if let Some(index) = current_non_tool_block_index {
-                            let event = json!({
-                                "type": "content_block_delta",
-                                "index": index,
-                                "delta": {"type": "text_delta", "text": leftover}
-                            });
-                            yield Ok(Bytes::from(format!("event: content_block_delta\ndata: {}\n\n",
-                                serde_json::to_string(&event).unwrap_or_default())));
-                        }
-                    } else {
-                        let (events, next) = antml_fallback::standalone_text_sse_events(
-                            &leftover, next_content_index);
-                        next_content_index = next;
-                        for ev in events { yield Ok(Bytes::from(ev)); }
-                    }
-                }
-            }
-
-            // antml 收尾改写了 stop_reason：更新缓存的 message_delta。
-            if antml_forced_tool_use {
-                if let Some((ref mut sr, _)) = pending_message_delta {
-                    *sr = Some("tool_use".to_string());
+                    let (events, _) = antml_fallback::standalone_text_sse_events(
+                        &leftover, next_content_index);
+                    for ev in events { yield Ok(Bytes::from(ev)); }
                 }
             }
 
@@ -1428,13 +1418,30 @@ mod tests {
     /// 端到端复现用户 bug：上游把 Claude 的 antml 工具调用当普通文本流式返回
     /// （finish_reason=stop），开启兜底后应还原成 tool_use 并把 stop_reason 改写。
     /// 关键点：antml 被切成多个 chunk（含哨兵跨界），模拟真实 SSE 分片。
+    fn fallback_schemas() -> antml_fallback::AntmlToolSchemas {
+        antml_fallback::extract_tool_schemas(&json!({
+            "tools": [{
+                "name": "Bash",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer"}
+                    },
+                    "required": ["command"]
+                }
+            }]
+        }))
+    }
+
     async fn collect_with_fallback(chunks: Vec<String>) -> Vec<Value> {
         let items: Vec<_> = chunks
             .into_iter()
             .map(|c| Ok::<_, std::io::Error>(Bytes::from(c.into_bytes())))
             .collect();
         let upstream = stream::iter(items);
-        let converted = create_anthropic_sse_stream_with_options(upstream, true);
+        let converted =
+            create_anthropic_sse_stream_with_options(upstream, true, fallback_schemas());
         let collected: Vec<_> = converted.collect().await;
         let merged = collected
             .into_iter()
@@ -1443,7 +1450,9 @@ mod tests {
         merged
             .split("\n\n")
             .filter_map(|block| {
-                let data = block.lines().find_map(|line| strip_sse_field(line, "data"))?;
+                let data = block
+                    .lines()
+                    .find_map(|line| strip_sse_field(line, "data"))?;
                 serde_json::from_str::<Value>(data).ok()
             })
             .collect()
@@ -1473,7 +1482,10 @@ mod tests {
                 "model": "claude-sonnet",
                 "choices": [{"delta": {"content": text}}]
             });
-            chunks.push(format!("data: {}\n\n", serde_json::to_string(&payload).unwrap()));
+            chunks.push(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&payload).unwrap()
+            ));
         }
         // finish_reason=stop —— 正是用户 bug 的收尾信号。
         chunks.push("data: {\"id\":\"c1\",\"model\":\"claude-sonnet\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_string());
@@ -1486,9 +1498,15 @@ mod tests {
             e.get("type").and_then(|v| v.as_str()) == Some("content_block_start")
                 && e.pointer("/content_block/type").and_then(|v| v.as_str()) == Some("tool_use")
         });
-        assert!(tool_start.is_some(), "应还原出 tool_use content_block_start");
+        assert!(
+            tool_start.is_some(),
+            "应还原出 tool_use content_block_start"
+        );
         assert_eq!(
-            tool_start.unwrap().pointer("/content_block/name").and_then(|v| v.as_str()),
+            tool_start
+                .unwrap()
+                .pointer("/content_block/name")
+                .and_then(|v| v.as_str()),
             Some("Bash"),
             "工具名应为 Bash"
         );
@@ -1499,14 +1517,19 @@ mod tests {
             .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("content_block_delta"))
             .filter_map(|e| e.pointer("/delta/partial_json").and_then(|v| v.as_str()))
             .collect();
-        assert!(input_json.contains("ls -la"), "入参应含命令 ls -la，实际: {input_json}");
+        assert!(
+            input_json.contains("ls -la"),
+            "入参应含命令 ls -la，实际: {input_json}"
+        );
 
         // 3) stop_reason 被改写为 tool_use（否则 Claude Code 会停住）。
         let msg_delta = events
             .iter()
             .find(|e| e.get("type").and_then(|v| v.as_str()) == Some("message_delta"));
         assert_eq!(
-            msg_delta.and_then(|e| e.pointer("/delta/stop_reason")).and_then(|v| v.as_str()),
+            msg_delta
+                .and_then(|e| e.pointer("/delta/stop_reason"))
+                .and_then(|v| v.as_str()),
             Some("tool_use"),
             "stop_reason 应被改写为 tool_use"
         );
@@ -1517,9 +1540,15 @@ mod tests {
             .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("content_block_delta"))
             .filter_map(|e| e.pointer("/delta/text").and_then(|v| v.as_str()))
             .collect();
-        assert!(!visible_text.contains("invoke"), "antml 标签不应作为可见文本泄漏，实际可见文本: {visible_text}");
+        assert!(
+            !visible_text.contains("invoke"),
+            "antml 标签不应作为可见文本泄漏，实际可见文本: {visible_text}"
+        );
         // 但哨兵之前的正常 prose 应作为文本保留。
-        assert!(visible_text.contains("我来看目录"), "哨兵前的正常正文应保留，实际: {visible_text}");
+        assert!(
+            visible_text.contains("我来看目录"),
+            "哨兵前的正常正文应保留，实际: {visible_text}"
+        );
     }
 
     /// 用户实际泄漏形式的端到端复现：**裸** <invoke>（无 antml: 前缀、无
@@ -1534,8 +1563,12 @@ mod tests {
         chunks.push("data: {\"id\":\"c1\",\"model\":\"claude-sonnet\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n".to_string());
         for piece in chars.chunks(5) {
             let text: String = piece.iter().collect();
-            let payload = json!({"id":"c1","model":"claude-sonnet","choices":[{"delta":{"content":text}}]});
-            chunks.push(format!("data: {}\n\n", serde_json::to_string(&payload).unwrap()));
+            let payload =
+                json!({"id":"c1","model":"claude-sonnet","choices":[{"delta":{"content":text}}]});
+            chunks.push(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&payload).unwrap()
+            ));
         }
         chunks.push("data: {\"id\":\"c1\",\"model\":\"claude-sonnet\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_string());
         chunks.push("data: [DONE]\n\n".to_string());
@@ -1549,7 +1582,10 @@ mod tests {
         });
         assert!(tool_start.is_some(), "裸 invoke 应还原出 tool_use");
         assert_eq!(
-            tool_start.unwrap().pointer("/content_block/name").and_then(|v| v.as_str()),
+            tool_start
+                .unwrap()
+                .pointer("/content_block/name")
+                .and_then(|v| v.as_str()),
             Some("Bash")
         );
         // 入参正确
@@ -1557,13 +1593,18 @@ mod tests {
             .iter()
             .filter_map(|e| e.pointer("/delta/partial_json").and_then(|v| v.as_str()))
             .collect();
-        assert!(input_json.contains("ls -la"), "入参应含 ls -la，实际: {input_json}");
+        assert!(
+            input_json.contains("ls -la"),
+            "入参应含 ls -la，实际: {input_json}"
+        );
         // stop_reason 改写
         let msg_delta = events
             .iter()
             .find(|e| e.get("type").and_then(|v| v.as_str()) == Some("message_delta"));
         assert_eq!(
-            msg_delta.and_then(|e| e.pointer("/delta/stop_reason")).and_then(|v| v.as_str()),
+            msg_delta
+                .and_then(|e| e.pointer("/delta/stop_reason"))
+                .and_then(|v| v.as_str()),
             Some("tool_use"),
             "stop_reason 应改写为 tool_use"
         );
@@ -1572,8 +1613,138 @@ mod tests {
             .iter()
             .filter_map(|e| e.pointer("/delta/text").and_then(|v| v.as_str()))
             .collect();
-        assert!(!visible_text.contains("invoke"), "裸标签不应泄漏为可见文本，实际: {visible_text}");
-        assert!(visible_text.contains("我来看目录"), "标记前正文应保留，实际: {visible_text}");
+        assert!(
+            !visible_text.contains("invoke"),
+            "裸标签不应泄漏为可见文本，实际: {visible_text}"
+        );
+        assert!(
+            visible_text.contains("我来看目录"),
+            "标记前正文应保留，实际: {visible_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_truncated_xml_is_not_recovered() {
+        let truncated = "<invoke name=\"Bash\"><parameter name=\"command\">git status".to_string();
+        let chunks = vec![
+            format!(
+                "data: {}\n\n",
+                json!({"id":"c1","model":"claude-sonnet","choices":[{"delta":{"content":truncated}}]})
+            ),
+            "data: {\"id\":\"c1\",\"model\":\"claude-sonnet\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ];
+
+        let events = collect_with_fallback(chunks).await;
+        assert!(!events.iter().any(|event| {
+            event.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use")
+        }));
+        assert!(events.iter().any(|event| {
+            event.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("end_turn")
+        }));
+    }
+
+    #[tokio::test]
+    async fn e2e_eof_without_finish_reason_never_executes_xml() {
+        let leaked = "<invoke name=\"Bash\"><parameter name=\"command\">pwd</parameter></invoke>";
+        let chunks = vec![format!(
+            "data: {}\n\n",
+            json!({"id":"c1","model":"claude-sonnet","choices":[{"delta":{"content":leaked}}]})
+        )];
+
+        let events = collect_with_fallback(chunks).await;
+        assert!(!events.iter().any(|event| {
+            event.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use")
+        }));
+        assert!(!events
+            .iter()
+            .any(|event| event_type(event) == Some("message_delta")));
+        assert!(!events
+            .iter()
+            .any(|event| event_type(event) == Some("message_stop")));
+    }
+
+    #[tokio::test]
+    async fn e2e_fenced_tool_example_remains_text() {
+        let example = "```xml\n<invoke name=\"Bash\"><parameter name=\"command\">pwd</parameter></invoke>\n```";
+        let chunks = vec![
+            format!(
+                "data: {}\n\n",
+                json!({"id":"c1","model":"claude-sonnet","choices":[{"delta":{"content":example}}]})
+            ),
+            "data: {\"id\":\"c1\",\"model\":\"claude-sonnet\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ];
+
+        let events = collect_with_fallback(chunks).await;
+        assert!(!events.iter().any(|event| {
+            event.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use")
+        }));
+        let visible: String = events
+            .iter()
+            .filter_map(|event| event.pointer("/delta/text").and_then(Value::as_str))
+            .collect();
+        assert_eq!(visible, example);
+    }
+
+    #[tokio::test]
+    async fn e2e_native_tool_call_wins_over_leaked_xml() {
+        let leaked = "<invoke name=\"Bash\"><parameter name=\"command\">pwd</parameter></invoke>";
+        let chunks = vec![
+            format!(
+                "data: {}\n\n",
+                json!({"id":"c1","model":"claude-sonnet","choices":[{"delta":{"content":leaked}}]})
+            ),
+            "data: {\"id\":\"c1\",\"model\":\"claude-sonnet\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"native_1\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}]}}]}\n\n".to_string(),
+            "data: {\"id\":\"c1\",\"model\":\"claude-sonnet\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n".to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ];
+
+        let events = collect_with_fallback(chunks).await;
+        let tool_starts: Vec<&Value> = events
+            .iter()
+            .filter(|event| {
+                event.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use")
+            })
+            .collect();
+        assert_eq!(tool_starts.len(), 1);
+        assert_eq!(
+            tool_starts[0]
+                .pointer("/content_block/id")
+                .and_then(Value::as_str),
+            Some("native_1")
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_partial_marker_is_flushed_before_terminal_events() {
+        let chunks = vec![
+            "data: {\"id\":\"c1\",\"model\":\"claude-sonnet\",\"choices\":[{\"delta\":{\"content\":\"normal<inv\"}}]}\n\n".to_string(),
+            "data: {\"id\":\"c1\",\"model\":\"claude-sonnet\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ];
+
+        let events = collect_with_fallback(chunks).await;
+        let visible: String = events
+            .iter()
+            .filter_map(|event| event.pointer("/delta/text").and_then(Value::as_str))
+            .collect();
+        assert_eq!(visible, "normal<inv");
+
+        let last_text = events
+            .iter()
+            .rposition(|event| event.pointer("/delta/text").is_some())
+            .unwrap();
+        let message_delta = events
+            .iter()
+            .position(|event| event_type(event) == Some("message_delta"))
+            .unwrap();
+        let message_stop = events
+            .iter()
+            .position(|event| event_type(event) == Some("message_stop"))
+            .unwrap();
+        assert!(last_text < message_delta);
+        assert!(message_delta < message_stop);
     }
 
     #[tokio::test]
@@ -1583,8 +1754,12 @@ mod tests {
             "data: {\"id\":\"c1\",\"model\":\"claude-sonnet\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n".to_string(),
         ];
         for w in ["你好", "，这是", "一段普通", "回复。"] {
-            let payload = json!({"id":"c1","model":"claude-sonnet","choices":[{"delta":{"content":w}}]});
-            chunks.push(format!("data: {}\n\n", serde_json::to_string(&payload).unwrap()));
+            let payload =
+                json!({"id":"c1","model":"claude-sonnet","choices":[{"delta":{"content":w}}]});
+            chunks.push(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&payload).unwrap()
+            ));
         }
         chunks.push("data: {\"id\":\"c1\",\"model\":\"claude-sonnet\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_string());
         chunks.push("data: [DONE]\n\n".to_string());
@@ -1592,9 +1767,12 @@ mod tests {
         let events = collect_with_fallback(chunks).await;
 
         // 不应出现任何 tool_use；stop_reason 应保持 end_turn；文本完整。
-        assert!(!events.iter().any(|e| {
-            e.pointer("/content_block/type").and_then(|v| v.as_str()) == Some("tool_use")
-        }), "普通文本不应产生 tool_use");
+        assert!(
+            !events.iter().any(|e| {
+                e.pointer("/content_block/type").and_then(|v| v.as_str()) == Some("tool_use")
+            }),
+            "普通文本不应产生 tool_use"
+        );
         let visible: String = events
             .iter()
             .filter_map(|e| e.pointer("/delta/text").and_then(|v| v.as_str()))
@@ -1604,7 +1782,9 @@ mod tests {
             .iter()
             .find(|e| e.get("type").and_then(|v| v.as_str()) == Some("message_delta"));
         assert_eq!(
-            msg_delta.and_then(|e| e.pointer("/delta/stop_reason")).and_then(|v| v.as_str()),
+            msg_delta
+                .and_then(|e| e.pointer("/delta/stop_reason"))
+                .and_then(|v| v.as_str()),
             Some("end_turn"),
             "普通文本 stop_reason 应为 end_turn"
         );

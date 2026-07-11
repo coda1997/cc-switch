@@ -11,12 +11,12 @@
 //!
 //! 本模块把这段泄漏的 antml 文本反解析回结构化 `tool_use`，让降级成文本的工具
 //! 调用被救回。**仅对 GitHub Copilot 供应商启用**（调用点门控），且受
-//! `CopilotOptimizerConfig.antml_fallback` 总开关控制（kill switch）。
+//! `CopilotOptimizerConfig.enabled` 与 `antml_fallback` 双重开关控制。
 //!
 //! ## 严格模式（Strict）
-//! 只有当文本包含带命名空间的 `function_calls` 包裹标签、且至少解析出一个 invoke
-//! 时才触发。这样当 Claude 合法地在正文里*讨论* antml 标签（例如解释本 bug）时，
-//! 不会被误判成工具调用。
+//! 只有完整闭合的调用位于文本末尾、处于 Markdown fenced code 之外，且工具名、参数名、
+//! required 字段与参数类型都通过当前请求的工具 schema 校验时才触发。裸标签与
+//! `antml:` 命名空间形式都支持；任何截断或歧义均失败关闭并保留为普通文本。
 //!
 //! ## 源码里的标签常量为何用 `concat!` 拆写
 //! 这些 antml 标签字面量若原样连续出现在源码中，会与本项目的工具链标签解析冲突，
@@ -24,6 +24,10 @@
 //! 拼回完整字符串，运行期零开销。请勿把它们合并回连续字面量。
 
 use serde_json::{Map, Value};
+use std::collections::{HashMap, HashSet};
+
+const MAX_RECOVERY_BYTES: usize = 256 * 1024;
+const MAX_RECOVERED_CALLS: usize = 16;
 
 /// `function_calls` 起始包裹标签（命名空间形式）。
 pub(crate) const OPEN_FUNCTION_CALLS: &str = concat!("<antml", ":function_calls>");
@@ -37,6 +41,12 @@ pub(crate) const CLOSE_INVOKE: &str = concat!("</antml", ":invoke>");
 pub(crate) const OPEN_PARAM_PREFIX: &str = concat!("<antml", ":parameter");
 /// `parameter` 结束标签。
 pub(crate) const CLOSE_PARAM: &str = concat!("</antml", ":parameter>");
+const BARE_CLOSE_FUNCTION_CALLS: &str = "</function_calls>";
+const BARE_CLOSE_INVOKE: &str = "</invoke>";
+const BARE_CLOSE_PARAM: &str = "</parameter>";
+const FUNCTION_CALLS_CLOSE: &[&str] = &[CLOSE_FUNCTION_CALLS, BARE_CLOSE_FUNCTION_CALLS];
+const INVOKE_CLOSE: &[&str] = &[CLOSE_INVOKE, BARE_CLOSE_INVOKE];
+const PARAM_CLOSE: &[&str] = &[CLOSE_PARAM, BARE_CLOSE_PARAM];
 
 // ---------------------------------------------------------------------------
 // 双形式标记集：真实泄漏既可能是命名空间形式（<invoke>），也可能是裸形式
@@ -54,13 +64,62 @@ pub(crate) const TRIGGER_MARKERS: &[&str] = &[
 ];
 
 /// `invoke` 起始标记（两形式）。
-const INVOKE_OPEN: &[&str] = &[concat!("<antml", ":invoke"), "<invoke"];
-/// `invoke` 结束标记（两形式）。
-const INVOKE_CLOSE: &[&str] = &[concat!("</antml", ":invoke>"), "</invoke>"];
+const INVOKE_OPEN: &[&str] = &[OPEN_INVOKE_PREFIX, "<invoke"];
 /// `parameter` 起始标记（两形式）。
-const PARAM_OPEN: &[&str] = &[concat!("<antml", ":parameter"), "<parameter"];
-/// `parameter` 结束标记（两形式）。
-const PARAM_CLOSE: &[&str] = &[concat!("</antml", ":parameter>"), "</parameter>"];
+const PARAM_OPEN: &[&str] = &[OPEN_PARAM_PREFIX, "<parameter"];
+
+#[derive(Debug, Clone)]
+struct AntmlToolSchema {
+    properties: Map<String, Value>,
+    required: HashSet<String>,
+}
+
+/// 当前请求中允许调用的工具及其输入 schema。
+#[derive(Debug, Clone, Default)]
+pub struct AntmlToolSchemas {
+    tools: HashMap<String, AntmlToolSchema>,
+}
+
+impl AntmlToolSchemas {
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
+    }
+}
+
+/// 从原始 Anthropic Messages 请求中提取工具 schema。
+pub fn extract_tool_schemas(body: &Value) -> AntmlToolSchemas {
+    let tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let name = tool.get("name").and_then(Value::as_str)?;
+            let input_schema = tool.get("input_schema").and_then(Value::as_object)?;
+            let properties = input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let required = input_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect();
+            Some((
+                name.to_string(),
+                AntmlToolSchema {
+                    properties,
+                    required,
+                },
+            ))
+        })
+        .collect();
+    AntmlToolSchemas { tools }
+}
 
 /// 在 `haystack` 中查找 `needles` 里任意一个的最早出现，返回 `(起始字节偏移, 命中长度)`。
 ///
@@ -105,121 +164,334 @@ pub enum SentinelScan {
     Partial { flush_len: usize },
 }
 
-/// 解析泄漏的工具调用文本 → 结构化调用。
+/// 严格解析泄漏的工具调用文本。
 ///
-/// 触发条件（宽松但有结构校验）：文本中出现 [`TRIGGER_MARKERS`] 之一（`<invoke` /
-/// `<invoke` / `<function_calls` / `<function_calls`），**且**至少能解析出
-/// 一个带 `name="..."` 的 invoke。外层 `function_calls` 包裹与 `antml:` 命名空间前缀
-/// 均为可选 —— 裸 `<invoke name="...">` 即可命中。
-///
-/// 结构校验（必须解析出有效 invoke）避免了正文里仅提到 "invoke" 一词就误判；配合
-/// 调用点的 Copilot-only 门控 + kill switch，false positive 面很小。
-pub fn parse_function_calls(text: &str) -> Option<ParsedAntml> {
-    // 区域起点 = 最早出现的触发标记（包裹标签或裸 invoke，两种前缀）。
-    let (start, _) = find_any(text, TRIGGER_MARKERS)?;
-    let prose = text[..start].trim().to_string();
+/// 仅接受完整闭合、位于正文末尾、未处于 Markdown fenced code 中、且工具名与参数
+/// 都能通过当前请求 schema 校验的调用。任何截断或歧义都返回 `None`，避免把普通文本
+/// 或半截工具调用升级成可执行的 `tool_use`。
+pub fn parse_function_calls(text: &str, schemas: &AntmlToolSchemas) -> Option<ParsedAntml> {
+    if text.len() > MAX_RECOVERY_BYTES || schemas.is_empty() {
+        return None;
+    }
 
-    // 从区域起点向后解析所有 invoke。若存在包裹标签，invoke 在其后；若为裸形式，
-    // 起点即 invoke。两种情况下从 `start` 扫描 invoke 起始标记都成立
-    // （包裹标签本身不含 invoke 子串）。
-    let calls = parse_invokes(&text[start..]);
-    if calls.is_empty() {
+    let start = find_trigger_outside_fence(text)?;
+    let prose = text[..start].trim().to_string();
+    let region = &text[start..];
+
+    let (body, trailing) =
+        if marker_at_start(region, &[OPEN_FUNCTION_CALLS, "<function_calls"]).is_some() {
+            let open_end = region.find('>')? + 1;
+            let (close_rel, close_len) = find_any(&region[open_end..], FUNCTION_CALLS_CLOSE)?;
+            let close_at = open_end + close_rel;
+            (&region[open_end..close_at], &region[close_at + close_len..])
+        } else {
+            (region, "")
+        };
+
+    if !trailing.trim().is_empty() {
+        return None;
+    }
+
+    let (calls, consumed) = parse_invokes(body, schemas)?;
+    if calls.is_empty() || !body[consumed..].trim().is_empty() {
         return None;
     }
     Some(ParsedAntml { prose, calls })
 }
 
-/// 依次解析每个 `invoke`（两种前缀形式，容忍缺失的结束标签）。
-fn parse_invokes(body: &str) -> Vec<AntmlToolCall> {
+fn find_trigger_outside_fence(text: &str) -> Option<usize> {
+    let mut cursor = 0usize;
+    while cursor < text.len() {
+        let (rel, marker_len) = find_any(&text[cursor..], TRIGGER_MARKERS)?;
+        let start = cursor + rel;
+        if has_tag_boundary(text, start + marker_len) && !is_inside_fenced_code(text, start) {
+            return Some(start);
+        }
+        cursor = start + marker_len;
+    }
+    None
+}
+
+fn has_tag_boundary(text: &str, end: usize) -> bool {
+    text[end..]
+        .chars()
+        .next()
+        .is_some_and(|ch| ch == '>' || ch.is_ascii_whitespace())
+}
+
+fn is_inside_fenced_code(text: &str, index: usize) -> bool {
+    text[..index].match_indices("```").count() % 2 == 1
+}
+
+fn marker_at_start<'a>(text: &str, markers: &'a [&'a str]) -> Option<&'a str> {
+    markers.iter().copied().find(|marker| {
+        text.starts_with(marker) && (marker.ends_with('>') || has_tag_boundary(text, marker.len()))
+    })
+}
+
+fn skip_whitespace(text: &str, cursor: &mut usize) {
+    while let Some(ch) = text[*cursor..].chars().next() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        *cursor += ch.len_utf8();
+    }
+}
+
+fn parse_invokes(body: &str, schemas: &AntmlToolSchemas) -> Option<(Vec<AntmlToolCall>, usize)> {
     let mut calls = Vec::new();
     let mut cursor = 0usize;
 
-    while let Some((rel, _)) = find_any(&body[cursor..], INVOKE_OPEN) {
-        let inv_start = cursor + rel;
-        let tag_region = &body[inv_start..];
-        // 找到起始标签的 `>`。
-        let Some(gt_rel) = tag_region.find('>') else {
+    loop {
+        skip_whitespace(body, &mut cursor);
+        if cursor == body.len() {
             break;
-        };
+        }
+
+        marker_at_start(&body[cursor..], INVOKE_OPEN)?;
+        let inv_start = cursor;
+        let tag_region = &body[inv_start..];
+        let gt_rel = tag_region.find('>')?;
         let open_tag = &tag_region[..gt_rel];
         let inner_start = inv_start + gt_rel + 1;
-
-        // 结束标签位置（缺失则取到末尾，兼容截断）。
-        let (inner_end, next_cursor) = match find_any(&body[inner_start..], INVOKE_CLOSE) {
-            Some((rel_close, close_len)) => {
-                let close_at = inner_start + rel_close;
-                (close_at, close_at + close_len)
-            }
-            None => (body.len(), body.len()),
-        };
-
-        if let Some(name) = extract_attr(open_tag, "name") {
-            let inner = &body[inner_start..inner_end];
-            let input = parse_params(inner);
-            calls.push(AntmlToolCall { name, input });
+        let (close_rel, close_len) = find_any(&body[inner_start..], INVOKE_CLOSE)?;
+        let inner_end = inner_start + close_rel;
+        let name = extract_attr(open_tag, "name")?;
+        let schema = schemas.tools.get(&name)?;
+        let input = parse_params(&body[inner_start..inner_end], schema)?;
+        calls.push(AntmlToolCall { name, input });
+        if calls.len() > MAX_RECOVERED_CALLS {
+            return None;
         }
-        cursor = next_cursor;
+        cursor = inner_end + close_len;
     }
 
-    calls
+    Some((calls, cursor))
 }
 
-/// 从单个 `invoke` 内部解析所有 `parameter`（两种前缀形式），组装成 input JSON 对象。
-fn parse_params(inner: &str) -> Value {
+fn parse_params(inner: &str, schema: &AntmlToolSchema) -> Option<Value> {
     let mut map = Map::new();
     let mut cursor = 0usize;
 
-    while let Some((rel, _)) = find_any(&inner[cursor..], PARAM_OPEN) {
-        let p_start = cursor + rel;
-        let tag_region = &inner[p_start..];
-        let Some(gt_rel) = tag_region.find('>') else {
+    loop {
+        skip_whitespace(inner, &mut cursor);
+        if cursor == inner.len() {
             break;
-        };
+        }
+
+        marker_at_start(&inner[cursor..], PARAM_OPEN)?;
+        let p_start = cursor;
+        let tag_region = &inner[p_start..];
+        let gt_rel = tag_region.find('>')?;
         let open_tag = &tag_region[..gt_rel];
         let value_start = p_start + gt_rel + 1;
-
-        let (value_end, next_cursor) = match find_any(&inner[value_start..], PARAM_CLOSE) {
-            Some((rel_close, close_len)) => {
-                let close_at = value_start + rel_close;
-                (close_at, close_at + close_len)
-            }
-            None => (inner.len(), inner.len()),
-        };
-
-        if let Some(name) = extract_attr(open_tag, "name") {
-            let raw = &inner[value_start..value_end];
-            map.insert(name, coerce_value(raw));
+        let (close_rel, close_len) = find_any(&inner[value_start..], PARAM_CLOSE)?;
+        let value_end = value_start + close_rel;
+        let name = extract_attr(open_tag, "name")?;
+        if map.contains_key(&name) {
+            return None;
         }
-        cursor = next_cursor;
+        let property_schema = schema.properties.get(&name)?;
+        let value = coerce_value(&inner[value_start..value_end], property_schema)?;
+        map.insert(name, value);
+        cursor = value_end + close_len;
     }
 
-    Value::Object(map)
+    if schema.required.iter().any(|name| !map.contains_key(name)) {
+        return None;
+    }
+
+    Some(Value::Object(map))
 }
 
-/// 参数值类型推断。
-///
-/// antml 参数值是标签间的原始文本。Claude 对结构化参数（对象/数组）写 JSON，
-/// 对标量参数写纯文本。没有工具 schema 时的安全启发式：
-/// - trim 后以 `{` 或 `[` 开头 → 尝试按 JSON 解析，失败则退回字符串；
-/// - 其余一律作为字符串（覆盖 Bash/Read/Edit/Grep 等主导工具的 string 参数，
-///   避免把 `123`、`command` 这类值错误地强转成 number）。
-fn coerce_value(raw: &str) -> Value {
+fn coerce_value(raw: &str, schema: &Value) -> Option<Value> {
+    for alternatives_key in ["anyOf", "oneOf"] {
+        if let Some(alternatives) = schema.get(alternatives_key).and_then(Value::as_array) {
+            return alternatives
+                .iter()
+                .find_map(|candidate| coerce_value(raw, candidate));
+        }
+    }
+
     let trimmed = raw.trim();
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-            return v;
+    let mut types: Vec<&str> = schema
+        .get("type")
+        .and_then(|value| match value {
+            Value::String(kind) => Some(vec![kind.as_str()]),
+            Value::Array(kinds) => Some(kinds.iter().filter_map(Value::as_str).collect()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if types.is_empty() {
+        if schema.get("properties").is_some() {
+            types.push("object");
+        } else if schema.get("items").is_some() {
+            types.push("array");
+        } else {
+            types.push("string");
         }
     }
-    Value::String(trimmed.to_string())
+
+    types.into_iter().find_map(|kind| {
+        let value = match kind {
+            // 字符串参数可能是 Edit.new_string 或多行 shell；不能 trim 掉有语义的缩进。
+            "string" => Some(Value::String(raw.to_string())),
+            "integer" => serde_json::from_str::<Value>(trimmed)
+                .ok()
+                .filter(|value| value.as_i64().is_some() || value.as_u64().is_some()),
+            "number" => serde_json::from_str::<Value>(trimmed)
+                .ok()
+                .filter(Value::is_number),
+            "boolean" => serde_json::from_str::<Value>(trimmed)
+                .ok()
+                .filter(Value::is_boolean),
+            "null" => (trimmed == "null").then_some(Value::Null),
+            "object" => parse_json_container(trimmed, Value::is_object),
+            "array" => parse_json_container(trimmed, Value::is_array),
+            _ => None,
+        }?;
+        schema_value_allowed(schema, &value).then_some(value)
+    })
 }
 
-/// 从起始标签文本里提取 `attr="..."` 的值。
+fn parse_json_container(trimmed: &str, predicate: fn(&Value) -> bool) -> Option<Value> {
+    let candidate = strip_markdown_json_wrapper(trimmed);
+    serde_json::from_str::<Value>(candidate)
+        .ok()
+        .filter(predicate)
+}
+
+fn strip_markdown_json_wrapper(value: &str) -> &str {
+    if let Some(inner) = value
+        .strip_prefix("```")
+        .and_then(|rest| rest.strip_suffix("```"))
+    {
+        let inner = inner.trim();
+        return inner
+            .strip_prefix("json")
+            .map(str::trim_start)
+            .unwrap_or(inner);
+    }
+    value
+        .strip_prefix('`')
+        .and_then(|rest| rest.strip_suffix('`'))
+        .map(str::trim)
+        .unwrap_or(value)
+}
+
+fn schema_value_allowed(schema: &Value, value: &Value) -> bool {
+    for alternatives_key in ["anyOf", "oneOf"] {
+        if let Some(alternatives) = schema.get(alternatives_key).and_then(Value::as_array) {
+            return alternatives
+                .iter()
+                .any(|candidate| schema_value_allowed(candidate, value));
+        }
+    }
+
+    if let Some(expected) = schema.get("const") {
+        if expected != value {
+            return false;
+        }
+    }
+    if !schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_none_or(|allowed| allowed.contains(value))
+    {
+        return false;
+    }
+
+    if let Some(expected_types) = schema.get("type") {
+        let matches_type = match expected_types {
+            Value::String(kind) => value_matches_type(value, kind),
+            Value::Array(kinds) => kinds
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|kind| value_matches_type(value, kind)),
+            _ => false,
+        };
+        if !matches_type {
+            return false;
+        }
+    }
+
+    match value {
+        Value::Object(object) => {
+            let required_ok = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .all(|name| object.contains_key(name));
+            if !required_ok {
+                return false;
+            }
+
+            let properties = schema.get("properties").and_then(Value::as_object);
+            object.iter().all(|(name, child)| {
+                if let Some(child_schema) = properties.and_then(|props| props.get(name)) {
+                    return schema_value_allowed(child_schema, child);
+                }
+                match schema.get("additionalProperties") {
+                    Some(Value::Bool(false)) => false,
+                    Some(child_schema) if child_schema.is_object() => {
+                        schema_value_allowed(child_schema, child)
+                    }
+                    _ => true,
+                }
+            })
+        }
+        Value::Array(items) => schema.get("items").is_none_or(|item_schema| {
+            items
+                .iter()
+                .all(|item| schema_value_allowed(item_schema, item))
+        }),
+        _ => true,
+    }
+}
+
+fn value_matches_type(value: &Value, kind: &str) -> bool {
+    match kind {
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        _ => false,
+    }
+}
+
 fn extract_attr(open_tag: &str, attr: &str) -> Option<String> {
-    let needle = format!("{attr}=\"");
-    let start = open_tag.find(&needle)? + needle.len();
-    let rest = &open_tag[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    let mut cursor = 0usize;
+    while let Some(rel) = open_tag[cursor..].find(attr) {
+        let start = cursor + rel;
+        let before_ok = start == 0
+            || open_tag[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-');
+        let after = start + attr.len();
+        let after_ok = open_tag[after..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-');
+        if before_ok && after_ok {
+            let rest = open_tag[after..].trim_start();
+            let rest = rest.strip_prefix('=')?.trim_start();
+            let quote = rest.chars().next()?;
+            if quote != '"' && quote != '\'' {
+                return None;
+            }
+            let value = &rest[quote.len_utf8()..];
+            let end = value.find(quote)?;
+            return (!value[..end].is_empty()).then(|| value[..end].to_string());
+        }
+        cursor = after;
+    }
+    None
 }
 
 /// 流式持有扫描：在增量文本 `pending` 中查找 `sentinel`。
@@ -229,6 +501,7 @@ fn extract_attr(open_tag: &str, attr: &str) -> Option<String> {
 ///   其余字节可安全 flush（`Partial{flush_len}`）。
 ///
 /// `sentinel` 为 ASCII，故所有切分点都是合法的 UTF-8 边界。
+#[cfg(test)]
 pub fn scan_for_sentinel(pending: &str, sentinel: &str) -> SentinelScan {
     if let Some(idx) = pending.find(sentinel) {
         return SentinelScan::Found { idx };
@@ -269,9 +542,7 @@ fn scan_for_any_sentinel(pending: &str, sentinels: &[&str]) -> SentinelScan {
     for s in sentinels {
         let max_overlap = pending.len().min(s.len().saturating_sub(1));
         for k in (1..=max_overlap).rev() {
-            if k > hold
-                && pending.is_char_boundary(pending.len() - k)
-                && pending.ends_with(&s[..k])
+            if k > hold && pending.is_char_boundary(pending.len() - k) && pending.ends_with(&s[..k])
             {
                 hold = k;
                 break;
@@ -283,12 +554,9 @@ fn scan_for_any_sentinel(pending: &str, sentinels: &[&str]) -> SentinelScan {
     }
 }
 
-/// 为救回的第 `i` 个工具调用生成确定性 id。
-///
-/// Claude Code 只用 id 关联后续 tool_result，且会原样回传我们发的 id，因此确定性
-/// 且消息内唯一即可，无需随机。
-pub fn synthetic_tool_id(i: usize) -> String {
-    format!("toolu_antml_{i}")
+/// 为救回的工具调用生成会话历史内唯一的 id。
+pub fn synthetic_tool_id() -> String {
+    format!("toolu_antml_{}", uuid::Uuid::new_v4().simple())
 }
 
 /// 非流式路径兜底：若 `msg` 是一条 Anthropic 消息，其 content 主体是一个泄漏了
@@ -296,10 +564,10 @@ pub fn synthetic_tool_id(i: usize) -> String {
 /// 置为 `tool_use`。发生改写返回 `true`，否则不动并返回 `false`。
 ///
 /// 调用方需自行完成 Copilot 门控与开关判断。
-pub fn rewrite_anthropic_message(msg: &mut Value) -> bool {
+pub fn rewrite_anthropic_message(msg: &mut Value, schemas: &AntmlToolSchemas) -> bool {
     // 仅在「正常文本收尾」时兜底：原生工具调用已产出 tool_use 时不介入。
     let stop_reason = msg.get("stop_reason").and_then(|s| s.as_str());
-    if !matches!(stop_reason, Some("end_turn") | None) {
+    if stop_reason != Some("end_turn") {
         return false;
     }
 
@@ -314,37 +582,31 @@ pub fn rewrite_anthropic_message(msg: &mut Value) -> bool {
         return false;
     }
 
-    // 收集全部 text，定位泄漏的 antml。
-    let combined_text: String = content
-        .iter()
-        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-        .collect::<Vec<_>>()
-        .join("");
-
-    let Some(parsed) = parse_function_calls(&combined_text) else {
+    let Some((text_index, parsed)) = content.iter().enumerate().find_map(|(index, block)| {
+        let text = block
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|_| block.get("type").and_then(Value::as_str) == Some("text"))?;
+        parse_function_calls(text, schemas).map(|parsed| (index, parsed))
+    }) else {
         return false;
     };
 
-    // 保留 antml 之前的非 text block（如 thinking），丢弃泄漏 antml 的 text block。
-    let mut new_content: Vec<Value> = content
-        .iter()
-        .filter(|b| b.get("type").and_then(|t| t.as_str()) != Some("text"))
-        .cloned()
-        .collect();
-
+    let mut replacement = Vec::with_capacity(parsed.calls.len() + 1);
     if !parsed.prose.is_empty() {
-        new_content.push(serde_json::json!({"type": "text", "text": parsed.prose}));
+        replacement.push(serde_json::json!({"type": "text", "text": parsed.prose}));
     }
-    for (i, call) in parsed.calls.iter().enumerate() {
-        new_content.push(serde_json::json!({
+    for call in &parsed.calls {
+        replacement.push(serde_json::json!({
             "type": "tool_use",
-            "id": synthetic_tool_id(i),
+            "id": synthetic_tool_id(),
             "name": call.name,
             "input": call.input,
         }));
     }
 
+    let mut new_content = content.clone();
+    new_content.splice(text_index..=text_index, replacement);
     msg["content"] = Value::Array(new_content);
     msg["stop_reason"] = Value::String("tool_use".to_string());
     true
@@ -389,11 +651,20 @@ impl AntmlStreamGuard {
         }
         if self.armed {
             self.hold.push_str(content);
+            if self.hold.len() > MAX_RECOVERY_BYTES {
+                self.armed = false;
+                self.enabled = false;
+                return std::mem::take(&mut self.hold);
+            }
             return String::new();
         }
         self.hold.push_str(content);
         match scan_for_any_sentinel(&self.hold, TRIGGER_MARKERS) {
             SentinelScan::Found { idx } => {
+                if self.hold.len() - idx > MAX_RECOVERY_BYTES {
+                    self.enabled = false;
+                    return std::mem::take(&mut self.hold);
+                }
                 let prose = self.hold[..idx].to_string();
                 let rest = self.hold[idx..].to_string();
                 self.hold = rest;
@@ -437,14 +708,15 @@ fn sse(event: &str, data: &Value) -> String {
 pub fn tool_use_sse_events(calls: &[AntmlToolCall], start_index: u32) -> (Vec<String>, u32) {
     let mut events = Vec::with_capacity(calls.len() * 3);
     let mut index = start_index;
-    for (i, call) in calls.iter().enumerate() {
+    for call in calls {
         let start = serde_json::json!({
             "type": "content_block_start",
             "index": index,
             "content_block": {
                 "type": "tool_use",
-                "id": synthetic_tool_id(i),
+                "id": synthetic_tool_id(),
                 "name": call.name,
+                "input": {},
             }
         });
         events.push(sse("content_block_start", &start));
@@ -495,9 +767,7 @@ mod tests {
 
     /// 用标签常量拼出一段泄漏的 antml 文本（测试里也不能出现连续字面量）。
     fn param(name: &str, value: &str) -> String {
-        format!(
-            "{OPEN_PARAM_PREFIX} name=\"{name}\">{value}{CLOSE_PARAM}"
-        )
+        format!("{OPEN_PARAM_PREFIX} name=\"{name}\">{value}{CLOSE_PARAM}")
     }
     fn invoke(name: &str, params: &[(&str, &str)]) -> String {
         let body: String = params.iter().map(|(n, v)| param(n, v)).collect();
@@ -519,11 +789,56 @@ mod tests {
         format!("<invoke name=\"{name}\">{body}</invoke>")
     }
 
+    fn schemas() -> AntmlToolSchemas {
+        extract_tool_schemas(&json!({
+            "tools": [
+                {
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                            "description": {"type": "string"},
+                            "timeout": {"type": "integer"},
+                            "run_in_background": {"type": "boolean"}
+                        },
+                        "required": ["command"]
+                    }
+                },
+                {
+                    "name": "Read",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "offset": {"type": "integer"}
+                        },
+                        "required": ["file_path"]
+                    }
+                },
+                {
+                    "name": "Tool",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "payload": {"type": "object"}
+                        },
+                        "required": ["payload"]
+                    }
+                }
+            ]
+        }))
+    }
+
+    fn parse(text: &str) -> Option<ParsedAntml> {
+        parse_function_calls(text, &schemas())
+    }
+
     #[test]
     fn parses_bare_invoke_without_prefix_or_wrapper() {
         // 用户实际泄漏形式：裸 <invoke>，无 <function_calls> 外壳，无 antml: 前缀。
         let text = bare_invoke("Bash", &[("command", "ls -la"), ("description", "list")]);
-        let parsed = parse_function_calls(&text).expect("裸 invoke 应能解析");
+        let parsed = parse(&text).expect("裸 invoke 应能解析");
         assert_eq!(parsed.calls.len(), 1);
         assert_eq!(parsed.calls[0].name, "Bash");
         assert_eq!(parsed.calls[0].input["command"], json!("ls -la"));
@@ -532,8 +847,11 @@ mod tests {
 
     #[test]
     fn parses_bare_invoke_with_prose() {
-        let text = format!("我来看目录。\n{}", bare_invoke("Bash", &[("command", "ls")]));
-        let parsed = parse_function_calls(&text).unwrap();
+        let text = format!(
+            "我来看目录。\n{}",
+            bare_invoke("Bash", &[("command", "ls")])
+        );
+        let parsed = parse(&text).unwrap();
         assert_eq!(parsed.prose, "我来看目录。");
         assert_eq!(parsed.calls[0].input["command"], json!("ls"));
     }
@@ -545,7 +863,7 @@ mod tests {
             bare_invoke("Read", &[("file_path", "/tmp/a")]),
             bare_invoke("Bash", &[("command", "echo hi")])
         );
-        let parsed = parse_function_calls(&text).unwrap();
+        let parsed = parse(&text).unwrap();
         assert_eq!(parsed.calls.len(), 2);
         assert_eq!(parsed.calls[0].name, "Read");
         assert_eq!(parsed.calls[1].name, "Bash");
@@ -555,7 +873,7 @@ mod tests {
     fn bare_multiline_command_preserved() {
         let cmd = "cd /tmp\nsed -n '1,5p' file\nhead -3 other";
         let text = bare_invoke("Bash", &[("command", cmd)]);
-        let parsed = parse_function_calls(&text).unwrap();
+        let parsed = parse(&text).unwrap();
         assert_eq!(parsed.calls[0].input["command"], json!(cmd));
     }
 
@@ -563,7 +881,7 @@ mod tests {
     fn bare_invoke_word_without_tag_does_not_trigger() {
         // 仅提到 "invoke" 一词、无真正 <invoke 标签 → 不误判。
         let text = "你可以用 invoke 来调用 Bash 工具运行 ls。";
-        assert!(parse_function_calls(text).is_none());
+        assert!(parse(text).is_none());
     }
 
     #[test]
@@ -574,7 +892,7 @@ mod tests {
             "content": [{"type": "text", "text": text}],
             "stop_reason": "end_turn",
         });
-        assert!(rewrite_anthropic_message(&mut msg));
+        assert!(rewrite_anthropic_message(&mut msg, &schemas()));
         assert_eq!(msg["stop_reason"], json!("tool_use"));
         let content = msg["content"].as_array().unwrap();
         assert_eq!(content[0], json!({"type": "text", "text": "先看目录"}));
@@ -590,7 +908,7 @@ mod tests {
         let out = g.feed_text(&text);
         assert_eq!(out, "看目录\n");
         assert!(g.is_armed());
-        let parsed = parse_function_calls(&g.take_buffer()).unwrap();
+        let parsed = parse(&g.take_buffer()).unwrap();
         assert_eq!(parsed.calls[0].input["command"], json!("ls"));
     }
 
@@ -601,17 +919,26 @@ mod tests {
         let out1 = g.feed_text("prose<inv");
         assert_eq!(out1, "prose"); // "<inv" 作为可能前缀被持有
         assert!(!g.is_armed());
-        let out2 = g.feed_text(&format!("oke name=\"Bash\">{}</invoke>", bare_param("command", "ls")));
+        let out2 = g.feed_text(&format!(
+            "oke name=\"Bash\">{}</invoke>",
+            bare_param("command", "ls")
+        ));
         assert_eq!(out2, "");
         assert!(g.is_armed());
-        let parsed = parse_function_calls(&g.take_buffer()).unwrap();
+        let parsed = parse(&g.take_buffer()).unwrap();
         assert_eq!(parsed.calls[0].input["command"], json!("ls"));
     }
 
     #[test]
     fn parses_single_bash_invoke() {
-        let text = wrap("", &[invoke("Bash", &[("command", "ls -la"), ("description", "list")])]);
-        let parsed = parse_function_calls(&text).expect("should parse");
+        let text = wrap(
+            "",
+            &[invoke(
+                "Bash",
+                &[("command", "ls -la"), ("description", "list")],
+            )],
+        );
+        let parsed = parse(&text).expect("should parse");
         assert_eq!(parsed.prose, "");
         assert_eq!(parsed.calls.len(), 1);
         assert_eq!(parsed.calls[0].name, "Bash");
@@ -620,9 +947,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_mixed_namespace_tags_when_fully_closed() {
+        let text = format!(
+            "{OPEN_FUNCTION_CALLS}<invoke name=\"Bash\">{OPEN_PARAM_PREFIX} name=\"command\">pwd</parameter></invoke>{CLOSE_FUNCTION_CALLS}"
+        );
+        let parsed = parse(&text).unwrap();
+        assert_eq!(parsed.calls[0].input["command"], json!("pwd"));
+    }
+
+    #[test]
     fn keeps_prose_before_wrapper() {
-        let text = wrap("我来看一下目录。\n", &[invoke("Bash", &[("command", "ls")])]);
-        let parsed = parse_function_calls(&text).unwrap();
+        let text = wrap(
+            "我来看一下目录。\n",
+            &[invoke("Bash", &[("command", "ls")])],
+        );
+        let parsed = parse(&text).unwrap();
         assert_eq!(parsed.prose, "我来看一下目录。");
         assert_eq!(parsed.calls[0].input["command"], json!("ls"));
     }
@@ -636,7 +975,7 @@ mod tests {
                 invoke("Bash", &[("command", "echo hi")]),
             ],
         );
-        let parsed = parse_function_calls(&text).unwrap();
+        let parsed = parse(&text).unwrap();
         assert_eq!(parsed.calls.len(), 2);
         assert_eq!(parsed.calls[0].name, "Read");
         assert_eq!(parsed.calls[1].name, "Bash");
@@ -644,56 +983,110 @@ mod tests {
 
     #[test]
     fn multiline_command_preserved() {
-        let cmd = "cd /tmp\nsed -n '1,5p' file\nhead -3 other";
+        let cmd = "  cd /tmp\nsed -n '1,5p' file\nhead -3 other\n";
         let text = wrap("", &[invoke("Bash", &[("command", cmd)])]);
-        let parsed = parse_function_calls(&text).unwrap();
+        let parsed = parse(&text).unwrap();
         assert_eq!(parsed.calls[0].input["command"], json!(cmd));
     }
 
     #[test]
     fn coerces_json_object_param() {
-        let text = wrap("", &[invoke("Tool", &[("payload", "{\"a\": 1, \"b\": [2,3]}")])]);
-        let parsed = parse_function_calls(&text).unwrap();
-        assert_eq!(parsed.calls[0].input["payload"], json!({"a": 1, "b": [2, 3]}));
+        let text = wrap(
+            "",
+            &[invoke("Tool", &[("payload", "{\"a\": 1, \"b\": [2,3]}")])],
+        );
+        let parsed = parse(&text).unwrap();
+        assert_eq!(
+            parsed.calls[0].input["payload"],
+            json!({"a": 1, "b": [2, 3]})
+        );
+    }
+
+    #[test]
+    fn coerces_backtick_wrapped_json_object_param() {
+        let text = wrap("", &[invoke("Tool", &[("payload", "`{\"a\": 1}`")])]);
+        let parsed = parse(&text).unwrap();
+        assert_eq!(parsed.calls[0].input["payload"], json!({"a": 1}));
     }
 
     #[test]
     fn scalar_number_like_stays_string() {
-        // 没有 schema 时，Bash 这类 string 参数即使值形如数字也必须保持字符串。
         let text = wrap("", &[invoke("Bash", &[("command", "123")])]);
-        let parsed = parse_function_calls(&text).unwrap();
+        let parsed = parse(&text).unwrap();
         assert_eq!(parsed.calls[0].input["command"], json!("123"));
+    }
+
+    #[test]
+    fn scalar_params_use_tool_schema_types() {
+        let text = wrap(
+            "",
+            &[invoke(
+                "Bash",
+                &[
+                    ("command", "sleep 1"),
+                    ("timeout", "120000"),
+                    ("run_in_background", "true"),
+                ],
+            )],
+        );
+        let parsed = parse(&text).unwrap();
+        assert_eq!(parsed.calls[0].input["timeout"], json!(120000));
+        assert_eq!(parsed.calls[0].input["run_in_background"], json!(true));
+    }
+
+    #[test]
+    fn rejects_unknown_tool_and_missing_required_param() {
+        let unknown = bare_invoke("DeleteEverything", &[("command", "rm -rf /")]);
+        assert!(parse(&unknown).is_none());
+
+        let missing = bare_invoke("Bash", &[("description", "missing command")]);
+        assert!(parse(&missing).is_none());
+    }
+
+    #[test]
+    fn rejects_tool_markup_inside_fenced_code_or_with_trailing_prose() {
+        let fenced = format!(
+            "示例：\n```xml\n{}\n```",
+            bare_invoke("Bash", &[("command", "ls")])
+        );
+        assert!(parse(&fenced).is_none());
+
+        let trailing = format!(
+            "{}\n这只是一个示例。",
+            bare_invoke("Bash", &[("command", "ls")])
+        );
+        assert!(parse(&trailing).is_none());
     }
 
     #[test]
     fn no_wrapper_returns_none() {
         // 合法地讨论工具，但没有命名空间包裹标签 → 不误判。
         let text = "你可以用 invoke 调用 Bash 工具来运行 ls。";
-        assert!(parse_function_calls(text).is_none());
+        assert!(parse(text).is_none());
     }
 
     #[test]
     fn wrapper_without_valid_invoke_returns_none() {
         let text = format!("{OPEN_FUNCTION_CALLS}{CLOSE_FUNCTION_CALLS}");
-        assert!(parse_function_calls(&text).is_none());
+        assert!(parse(&text).is_none());
     }
 
     #[test]
-    fn tolerates_truncated_close_tags() {
-        // 流被截断：缺 parameter/invoke/function_calls 的结束标签。
+    fn rejects_truncated_close_tags() {
         let text = format!(
             "{OPEN_FUNCTION_CALLS}{OPEN_INVOKE_PREFIX} name=\"Bash\">{OPEN_PARAM_PREFIX} name=\"command\">ls -la"
         );
-        let parsed = parse_function_calls(&text).unwrap();
-        assert_eq!(parsed.calls[0].name, "Bash");
-        assert_eq!(parsed.calls[0].input["command"], json!("ls -la"));
+        assert!(parse(&text).is_none());
     }
 
     #[test]
     fn scan_finds_full_sentinel() {
         let pending = format!("prefix{OPEN_FUNCTION_CALLS}rest");
         match scan_for_sentinel(&pending, OPEN_FUNCTION_CALLS) {
-            SentinelScan::Found { idx } => assert_eq!(&pending[idx..idx + OPEN_FUNCTION_CALLS.len()], OPEN_FUNCTION_CALLS),
+            SentinelScan::Found { idx } => assert_eq!(
+                &pending[idx..idx + OPEN_FUNCTION_CALLS.len()],
+                OPEN_FUNCTION_CALLS
+            ),
             other => panic!("expected Found, got {other:?}"),
         }
     }
@@ -732,7 +1125,7 @@ mod tests {
             "content": [{"type": "text", "text": text}],
             "stop_reason": "end_turn",
         });
-        assert!(rewrite_anthropic_message(&mut msg));
+        assert!(rewrite_anthropic_message(&mut msg, &schemas()));
         assert_eq!(msg["stop_reason"], json!("tool_use"));
         let content = msg["content"].as_array().unwrap();
         assert_eq!(content[0], json!({"type": "text", "text": "先看目录"}));
@@ -742,12 +1135,27 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_uses_unique_ids_across_messages() {
+        let text = bare_invoke("Bash", &[("command", "ls")]);
+        let mut first = json!({
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+        });
+        let mut second = first.clone();
+        let schemas = schemas();
+
+        assert!(rewrite_anthropic_message(&mut first, &schemas));
+        assert!(rewrite_anthropic_message(&mut second, &schemas));
+        assert_ne!(first["content"][0]["id"], second["content"][0]["id"]);
+    }
+
+    #[test]
     fn rewrite_noop_without_wrapper() {
         let mut msg = json!({
             "content": [{"type": "text", "text": "普通回答，没有工具调用"}],
             "stop_reason": "end_turn",
         });
-        assert!(!rewrite_anthropic_message(&mut msg));
+        assert!(!rewrite_anthropic_message(&mut msg, &schemas()));
         assert_eq!(msg["content"][0]["text"], json!("普通回答，没有工具调用"));
     }
 
@@ -757,12 +1165,12 @@ mod tests {
             "content": [{"type": "tool_use", "id": "x", "name": "Bash", "input": {}}],
             "stop_reason": "tool_use",
         });
-        assert!(!rewrite_anthropic_message(&mut msg));
+        assert!(!rewrite_anthropic_message(&mut msg, &schemas()));
     }
 
     #[test]
-    fn synthetic_ids_unique_within_message() {
-        assert_ne!(synthetic_tool_id(0), synthetic_tool_id(1));
+    fn synthetic_ids_are_unique_across_responses() {
+        assert_ne!(synthetic_tool_id(), synthetic_tool_id());
     }
 
     #[test]
@@ -789,10 +1197,10 @@ mod tests {
         let out = g.feed_text(&text);
         assert_eq!(out, "看目录\n"); // 哨兵之前的 prose 原样放行（流式不 trim，wrap 的 prose 以 \n 结尾）
         assert!(g.is_armed());
-        // 后续文本继续缓冲。
-        assert_eq!(g.feed_text(" ignored"), "");
+        // 工具调用后的格式空白继续缓冲，但不影响严格解析。
+        assert_eq!(g.feed_text(" \n"), "");
         let buf = g.take_buffer();
-        let parsed = parse_function_calls(&buf).unwrap();
+        let parsed = parse(&buf).unwrap();
         assert_eq!(parsed.calls[0].name, "Bash");
     }
 
@@ -807,10 +1215,13 @@ mod tests {
         let out1 = g.feed_text(&format!("prose{first}"));
         assert_eq!(out1, "prose"); // 哨兵前缀被持有
         assert!(!g.is_armed());
-        let out2 = g.feed_text(&format!("{second}{}", invoke("Bash", &[("command", "ls")])));
+        let out2 = g.feed_text(&format!(
+            "{second}{}{CLOSE_FUNCTION_CALLS}",
+            invoke("Bash", &[("command", "ls")])
+        ));
         assert_eq!(out2, ""); // 现在完整哨兵出现，prose 之前已发完
         assert!(g.is_armed());
-        let parsed = parse_function_calls(&g.take_buffer()).unwrap();
+        let parsed = parse(&g.take_buffer()).unwrap();
         assert_eq!(parsed.calls[0].input["command"], json!("ls"));
     }
 
@@ -833,10 +1244,29 @@ mod tests {
     }
 
     #[test]
+    fn guard_disables_recovery_when_candidate_exceeds_limit() {
+        let mut guard = AntmlStreamGuard::new(true);
+        let oversized = format!(
+            "{}{}",
+            bare_invoke("Bash", &[("command", "ls")]),
+            "x".repeat(MAX_RECOVERY_BYTES)
+        );
+        assert_eq!(guard.feed_text(&oversized), oversized);
+        assert!(!guard.is_armed());
+        assert_eq!(guard.feed_text("tail"), "tail");
+    }
+
+    #[test]
     fn tool_use_events_shape_and_index() {
         let calls = vec![
-            AntmlToolCall { name: "Bash".into(), input: json!({"command": "ls"}) },
-            AntmlToolCall { name: "Read".into(), input: json!({"file_path": "/x"}) },
+            AntmlToolCall {
+                name: "Bash".into(),
+                input: json!({"command": "ls"}),
+            },
+            AntmlToolCall {
+                name: "Read".into(),
+                input: json!({"file_path": "/x"}),
+            },
         ];
         let (events, next) = tool_use_sse_events(&calls, 2);
         assert_eq!(events.len(), 6); // 2 calls × 3 events
@@ -845,5 +1275,21 @@ mod tests {
         assert!(events[0].contains("\"index\":2"));
         assert!(events[1].contains("input_json_delta"));
         assert!(events[3].contains("\"index\":3"));
+        let first: Value = serde_json::from_str(
+            events[0]
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap();
+        let second: Value = serde_json::from_str(
+            events[3]
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["content_block"]["input"], json!({}));
+        assert_ne!(first["content_block"]["id"], second["content_block"]["id"]);
     }
 }
