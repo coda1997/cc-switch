@@ -310,6 +310,8 @@ function ProviderFormFull({
     isPartner?: boolean;
     partnerPromotionKey?: string;
     suggestedDefaults?: OpenClawSuggestedDefaults;
+    providerType?: "github_copilot" | "codex_oauth";
+    requiresOAuth?: boolean;
   } | null>(null);
   const [isEndpointModalOpen, setIsEndpointModalOpen] = useState(false);
   const [isCodexEndpointModalOpen, setIsCodexEndpointModalOpen] =
@@ -1126,8 +1128,10 @@ function ProviderFormFull({
     // OAuth 未登录：B 类（token 根本不存在，保存了也没法建立）
     const isCopilotProvider =
       templatePreset?.providerType === "github_copilot" ||
+      activePreset?.providerType === "github_copilot" ||
       initialData?.meta?.providerType === "github_copilot" ||
-      baseUrl.includes("githubcopilot.com");
+      baseUrl.includes("githubcopilot.com") ||
+      codexBaseUrl.includes("githubcopilot.com");
     const isCodexOauthProvider =
       templatePreset?.providerType === "codex_oauth" ||
       initialData?.meta?.providerType === "codex_oauth";
@@ -1258,8 +1262,10 @@ function ProviderFormFull({
     // OAuth / 其它身份识别（与 handleSubmit 保持一致）
     const isCopilotProvider =
       templatePreset?.providerType === "github_copilot" ||
+      activePreset?.providerType === "github_copilot" ||
       initialData?.meta?.providerType === "github_copilot" ||
-      baseUrl.includes("githubcopilot.com");
+      baseUrl.includes("githubcopilot.com") ||
+      codexBaseUrl.includes("githubcopilot.com");
     const isCodexOauthProvider =
       templatePreset?.providerType === "codex_oauth" ||
       initialData?.meta?.providerType === "codex_oauth";
@@ -1435,7 +1441,9 @@ function ProviderFormFull({
 
     // 确定 providerType（新建时从预设获取，编辑时从现有数据获取）
     const providerType =
-      templatePreset?.providerType || initialData?.meta?.providerType;
+      templatePreset?.providerType ||
+      activePreset?.providerType ||
+      initialData?.meta?.providerType;
 
     const nextMeta: ProviderMeta = {
       ...(baseMeta ?? {}),
@@ -1653,6 +1661,13 @@ function ProviderFormFull({
       category: entry.preset.category,
       isPartner: entry.preset.isPartner,
       partnerPromotionKey: entry.preset.partnerPromotionKey,
+      providerType: (
+        entry.preset as {
+          providerType?: "github_copilot" | "codex_oauth";
+        }
+      ).providerType,
+      requiresOAuth: (entry.preset as { requiresOAuth?: boolean })
+        .requiresOAuth,
     });
 
     if (appId === "codex") {
@@ -2153,6 +2168,19 @@ function ProviderFormFull({
               onLocalProxyHeadersOverrideChange={setLocalProxyHeadersOverride}
               localProxyBodyOverride={localProxyBodyOverride}
               onLocalProxyBodyOverrideChange={setLocalProxyBodyOverride}
+              isCopilotPreset={
+                activePreset?.providerType === "github_copilot" ||
+                initialData?.meta?.providerType === "github_copilot" ||
+                codexBaseUrl.includes("githubcopilot.com")
+              }
+              usesOAuth={
+                activePreset?.requiresOAuth === true ||
+                activePreset?.providerType === "github_copilot" ||
+                initialData?.meta?.providerType === "github_copilot" ||
+                codexBaseUrl.includes("githubcopilot.com")
+              }
+              selectedGitHubAccountId={selectedGitHubAccountId}
+              onGitHubAccountSelect={setSelectedGitHubAccountId}
             />
           )}
 

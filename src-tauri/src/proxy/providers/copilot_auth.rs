@@ -139,6 +139,68 @@ pub const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.38.2";
 pub const COPILOT_API_VERSION: &str = "2025-10-01";
 pub const COPILOT_INTEGRATION_ID: &str = "vscode-chat";
 
+/// 构建 GitHub Copilot 上游请求所需的指纹 / 追踪头。
+///
+/// 供 Claude 与 Codex 两个适配器共用，保证两条链路发往
+/// `api.githubcopilot.com` 的头部完全一致（editor-version、
+/// copilot-integration-id、x-initiator 等）。`bearer` 为已拼好的
+/// `Authorization` 头值（含 `Bearer ` 前缀），token 由 forwarder 动态注入。
+///
+/// `x-initiator` / `x-interaction-type` / `x-request-id` 等会在 forwarder
+/// 的 Copilot 优化器阶段按分类结果就地覆盖；此处提供默认值。
+pub fn copilot_request_headers(
+    bearer: &str,
+) -> Result<Vec<(http::HeaderName, http::HeaderValue)>, crate::proxy::error::ProxyError> {
+    use crate::proxy::providers::adapter::auth_header_value as hv;
+    use http::{HeaderName, HeaderValue};
+
+    // 生成请求追踪 ID
+    let request_id = uuid::Uuid::new_v4().to_string();
+    Ok(vec![
+        (HeaderName::from_static("authorization"), hv(bearer)?),
+        (
+            HeaderName::from_static("editor-version"),
+            HeaderValue::from_static(COPILOT_EDITOR_VERSION),
+        ),
+        (
+            HeaderName::from_static("editor-plugin-version"),
+            HeaderValue::from_static(COPILOT_PLUGIN_VERSION),
+        ),
+        (
+            HeaderName::from_static("copilot-integration-id"),
+            HeaderValue::from_static(COPILOT_INTEGRATION_ID),
+        ),
+        (
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static(COPILOT_USER_AGENT),
+        ),
+        (
+            HeaderName::from_static("x-github-api-version"),
+            HeaderValue::from_static(COPILOT_API_VERSION),
+        ),
+        // 26-04-01新增的copilot关键 headers
+        (
+            HeaderName::from_static("openai-intent"),
+            HeaderValue::from_static("conversation-agent"),
+        ),
+        (
+            HeaderName::from_static("x-initiator"),
+            HeaderValue::from_static("user"),
+        ),
+        (
+            HeaderName::from_static("x-interaction-type"),
+            HeaderValue::from_static("conversation-agent"),
+        ),
+        // x-interaction-id 由 forwarder 按需注入（仅在有 session 时）
+        (
+            HeaderName::from_static("x-vscode-user-agent-library-version"),
+            HeaderValue::from_static("electron-fetch"),
+        ),
+        (HeaderName::from_static("x-request-id"), hv(&request_id)?),
+        (HeaderName::from_static("x-agent-task-id"), hv(&request_id)?),
+    ])
+}
+
 /// Copilot 使用量响应
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CopilotUsageResponse {

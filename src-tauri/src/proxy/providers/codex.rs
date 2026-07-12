@@ -410,6 +410,24 @@ impl CodexAdapter {
         CODEX_CLIENT_REGEX.is_match(user_agent)
     }
 
+    /// 检测该 Codex Provider 是否为 GitHub Copilot 供应商。
+    ///
+    /// 与 ClaudeAdapter 判定保持一致：优先看 `meta.provider_type`，
+    /// 再回退到 base_url 域名（兼容旧数据）。
+    fn is_github_copilot(&self, provider: &Provider) -> bool {
+        if let Some(meta) = provider.meta.as_ref() {
+            if meta.provider_type.as_deref() == Some("github_copilot") {
+                return true;
+            }
+        }
+        if let Ok(base_url) = self.extract_base_url(provider) {
+            if base_url.contains("githubcopilot.com") {
+                return true;
+            }
+        }
+        false
+    }
+
     /// 从 Provider 配置中提取 API Key
     fn extract_key(&self, provider: &Provider) -> Option<String> {
         // 1. 尝试从 env 中获取
@@ -527,6 +545,14 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn extract_auth(&self, provider: &Provider) -> Option<AuthInfo> {
+        // GitHub Copilot：真实 token 由 forwarder 从 CopilotAuthManager 动态换取，
+        // 这里返回带 GitHubCopilot 策略的占位 AuthInfo 以触发该注入路径。
+        if self.is_github_copilot(provider) {
+            return Some(AuthInfo::new(
+                String::new(),
+                AuthStrategy::GitHubCopilot,
+            ));
+        }
         self.extract_key(provider)
             .map(|key| AuthInfo::new(key, AuthStrategy::Bearer))
     }
@@ -534,6 +560,15 @@ impl ProviderAdapter for CodexAdapter {
     fn build_url(&self, base_url: &str, endpoint: &str) -> String {
         let base_trimmed = base_url.trim_end_matches('/');
         let endpoint_trimmed = endpoint.trim_start_matches('/');
+
+        // GitHub Copilot 端点不使用 /v1 前缀（直接 /chat/completions），
+        // 且 base_url 为纯 origin（api.githubcopilot.com / 企业版域名）。
+        // 走通用补 /v1 逻辑会产生 /v1/chat/completions 导致上游 404。
+        if base_trimmed.contains("githubcopilot.com")
+            || base_trimmed.starts_with("https://copilot-api.")
+        {
+            return format!("{base_trimmed}/{endpoint_trimmed}");
+        }
 
         // OpenAI/Codex 的 base_url 可能是：
         // - 纯 origin: https://api.openai.com  (需要自动补 /v1)
@@ -569,6 +604,10 @@ impl ProviderAdapter for CodexAdapter {
     ) -> Result<Vec<(http::HeaderName, http::HeaderValue)>, ProxyError> {
         use super::adapter::auth_header_value;
         let bearer = format!("Bearer {}", auth.api_key);
+        // GitHub Copilot：注入与 Claude 链路一致的指纹 / 追踪头。
+        if auth.strategy == AuthStrategy::GitHubCopilot {
+            return super::copilot_auth::copilot_request_headers(&bearer);
+        }
         Ok(vec![(
             http::HeaderName::from_static("authorization"),
             auth_header_value(&bearer)?,

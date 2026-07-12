@@ -36,6 +36,10 @@ export interface CodexProviderPreset {
   modelCatalog?: CodexCatalogModel[];
   // Codex Responses -> Chat Completions reasoning capability defaults
   codexChatReasoning?: CodexChatReasoning;
+  // 特殊供应商类型（如 github_copilot），用于识别 OAuth 登录流程
+  providerType?: "github_copilot";
+  // 是否需要 OAuth 登录（而非 API Key）
+  requiresOAuth?: boolean;
 }
 
 /**
@@ -116,6 +120,32 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     },
     icon: "openai",
     iconColor: "#00A67E",
+  },
+  {
+    name: "GitHub Copilot",
+    websiteUrl: "https://github.com/features/copilot",
+    category: "third_party",
+    providerType: "github_copilot",
+    requiresOAuth: true,
+    // OAuth 登录：无需 API Key。真实 token 由代理后端从
+    // CopilotAuthManager 动态换取并注入。
+    auth: {},
+    // wire_api = "chat" 触发代理的 responses -> chat completions 转换，
+    // 以对接 Copilot 仅支持的 /chat/completions 端点。
+    // base_url 由后端按账号动态解析（默认 api.githubcopilot.com，
+    // 企业版自动替换），此处仅作占位。
+    config: `model_provider = "github_copilot"
+model = "gpt-5.5"
+model_reasoning_effort = "high"
+disable_response_storage = true
+
+[model_providers.github_copilot]
+name = "GitHub Copilot"
+base_url = "https://api.githubcopilot.com"
+wire_api = "chat"`,
+    apiFormat: "openai_chat",
+    icon: "github",
+    iconColor: "#000000",
   },
   {
     name: "Shengsuanyun",

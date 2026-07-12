@@ -168,7 +168,21 @@ impl ProviderType {
                 }
                 ProviderType::Claude
             }
-            AppType::Codex => ProviderType::Codex,
+            AppType::Codex => {
+                // GitHub Copilot 作为 Codex 供应商：优先看 provider_type，
+                // 再回退 base_url 域名（兼容旧数据）。
+                if let Some(meta) = provider.meta.as_ref() {
+                    if meta.provider_type.as_deref() == Some("github_copilot") {
+                        return ProviderType::GitHubCopilot;
+                    }
+                }
+                if let Ok(base_url) = CodexAdapter::new().extract_base_url(provider) {
+                    if base_url.contains("githubcopilot.com") {
+                        return ProviderType::GitHubCopilot;
+                    }
+                }
+                ProviderType::Codex
+            }
             AppType::Gemini => {
                 // 检测是否为 CLI 模式（OAuth）
                 let adapter = GeminiAdapter::new();

@@ -27,6 +27,7 @@ import {
 } from "lucide-react";
 import EndpointSpeedTest from "./EndpointSpeedTest";
 import { ApiKeySection, EndpointField, ModelDropdown } from "./shared";
+import { CopilotAuthSection } from "./CopilotAuthSection";
 import {
   fetchModelsForConfig,
   showFetchModelsError,
@@ -90,6 +91,12 @@ interface CodexFormFieldsProps {
   onLocalProxyHeadersOverrideChange: (value: string) => void;
   localProxyBodyOverride: string;
   onLocalProxyBodyOverrideChange: (value: string) => void;
+
+  // GitHub Copilot OAuth（providerType === "github_copilot"）
+  isCopilotPreset?: boolean;
+  usesOAuth?: boolean;
+  selectedGitHubAccountId?: string | null;
+  onGitHubAccountSelect?: (accountId: string | null) => void;
 }
 
 type CodexCatalogRow = CodexCatalogModel & { rowId: string };
@@ -169,6 +176,10 @@ export function CodexFormFields({
   onLocalProxyHeadersOverrideChange,
   localProxyBodyOverride,
   onLocalProxyBodyOverrideChange,
+  isCopilotPreset,
+  usesOAuth,
+  selectedGitHubAccountId,
+  onGitHubAccountSelect,
 }: CodexFormFieldsProps) {
   const { t } = useTranslation();
 
@@ -346,26 +357,36 @@ export function CodexFormFields({
 
   return (
     <>
-      {/* Codex API Key 输入框 */}
-      <ApiKeySection
-        id="codexApiKey"
-        label="API Key"
-        value={codexApiKey}
-        onChange={onApiKeyChange}
-        category={category}
-        shouldShowLink={shouldShowApiKeyLink}
-        websiteUrl={websiteUrl}
-        isPartner={isPartner}
-        partnerPromotionKey={partnerPromotionKey}
-        placeholder={{
-          official: t("providerForm.codexOfficialNoApiKey", {
-            defaultValue: "官方供应商无需 API Key",
-          }),
-          thirdParty: t("providerForm.codexApiKeyAutoFill", {
-            defaultValue: "输入 API Key，将自动填充到配置",
-          }),
-        }}
-      />
+      {/* GitHub Copilot OAuth 认证 */}
+      {isCopilotPreset && (
+        <CopilotAuthSection
+          selectedAccountId={selectedGitHubAccountId}
+          onAccountSelect={onGitHubAccountSelect}
+        />
+      )}
+
+      {/* Codex API Key 输入框（OAuth 预设时隐藏） */}
+      {!usesOAuth && (
+        <ApiKeySection
+          id="codexApiKey"
+          label="API Key"
+          value={codexApiKey}
+          onChange={onApiKeyChange}
+          category={category}
+          shouldShowLink={shouldShowApiKeyLink}
+          websiteUrl={websiteUrl}
+          isPartner={isPartner}
+          partnerPromotionKey={partnerPromotionKey}
+          placeholder={{
+            official: t("providerForm.codexOfficialNoApiKey", {
+              defaultValue: "官方供应商无需 API Key",
+            }),
+            thirdParty: t("providerForm.codexApiKeyAutoFill", {
+              defaultValue: "输入 API Key，将自动填充到配置",
+            }),
+          }}
+        />
+      )}
 
       {/* Codex Base URL 输入框 */}
       {shouldShowSpeedTest && (
