@@ -404,6 +404,13 @@ mod tests {
     }
 
     #[test]
+    fn strips_gpt_one_m_suffix_before_copilot_live_resolution() {
+        let body = json!({"model": "gpt-5.6-sol[1M]"});
+        let result = strip_one_m_suffix_for_upstream_from_body(body);
+        assert_eq!(result["model"], "gpt-5.6-sol");
+    }
+
+    #[test]
     fn strips_one_m_suffix_after_mapping() {
         let mut provider = create_provider_with_mapping();
         provider.settings_config = json!({

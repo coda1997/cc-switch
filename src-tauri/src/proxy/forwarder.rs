@@ -1171,6 +1171,11 @@ impl RequestForwarder {
         if is_copilot {
             mapped_body =
                 super::providers::copilot_model_map::apply_copilot_model_normalization(mapped_body);
+            // Claude Code 的 `[1M]` 是客户端能力标记。Claude Copilot 模型已在上一步
+            // 转成 upstream 的 `-1m` SKU；非 Claude 模型则需要在 live-list 匹配前
+            // 剥掉该标记（例如 `gpt-5.6-sol[1M]` → `gpt-5.6-sol`）。
+            mapped_body =
+                super::model_mapper::strip_one_m_suffix_for_upstream_from_body(mapped_body);
             self.apply_copilot_live_model_resolution(provider, &mut mapped_body)
                 .await;
         } else if !codex_responses_to_anthropic {
